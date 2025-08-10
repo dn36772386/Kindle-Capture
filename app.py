@@ -8,6 +8,9 @@ from core.config import Settings
 from core.logging_conf import setup_logging, get_logger
 from core.windows import list_windows, bring_to_front_and_maximize
 from core.capture import run_capture, CaptureError
+from core.final_recrop import run_final_recrop
+from core.app_ui import safe_eval_js, update_progress
+from core.windows import get_window_rect, bring_to_front_and_maximize as bring_to_front
 from core.toast import show_toast
 
 APP_TITLE = "SnapLite"
@@ -74,23 +77,47 @@ class Api:
     def _capture_thread(self, hwnd: int, opt: dict):
         start = time.time()
         try:
-            result = run_capture(hwnd, opt, logger)
-            dur = time.time() - start
-            msg = f"完了: {result['captured_pages']} ページ（{dur:.1f}秒）\n保存先: {result['output_dir']}"
-            logger.info(msg)
-            show_toast(APP_TITLE, msg)
-            # 完了後に保存フォルダを開く（設定でONのとき）
+            # 1) キャプチャ（非同期保存＋進捗）
+            title = opt.get("base_title") or opt.get("actual_title") or "SnapLite"
+            meta = run_capture(
+                hwnd=hwnd,
+                opt=opt,
+                title=title,
+                progress_cb=lambda n: update_progress(ui_window, "capture", n, 0),
+            )
+        except Exception as e:
+            safe_eval_js(ui_window, f'try{{window.handleError && window.handleError("{str(e)}")}}catch(e){{}}')
+            logger.exception("capture failed early")
+            return
+
+        raw_paths = meta["raw_paths"]
+        out_dir = meta["output_dir"]
+
+        # 2) Kindle を最小化 → アプリを前面へ
+        if opt.get("minimize_kindle_on_postprocess", True):
             try:
-                if settings.open_folder_on_finish:
-                    os.startfile(result['output_dir'])
+                win32gui.ShowWindow(hwnd, 6)  # SW_MINIMIZE
             except Exception:
                 pass
-        except CaptureError as ce:
-            logger.warning(f"CaptureError: {ce}")
-            show_toast(APP_TITLE, f"中断: {ce}")
-        except Exception as e:
-            logger.exception("capture fatal error")
-            show_toast(APP_TITLE, f"失敗: {e}")
+        if opt.get("bring_app_front_on_postprocess", True) and ui_window:
+            try:
+                safe_eval_js(ui_window, "try{window.focus && window.focus()}catch(e){}")
+            except Exception:
+                pass
+
+        # 3) 仕上げトリム（進捗は 2N 想定）
+        total = max(1, len(raw_paths) * 2)
+        out_files = run_final_recrop(
+            {"raw_paths": raw_paths, "output_dir": out_dir, "opt": opt},
+            progress_cb=lambda i: update_progress(ui_window, "trim", i, total),
+        )
+
+        # 4) 完了通知
+        safe_eval_js(ui_window, "try{window.handleDone && window.handleDone()}catch(e){}")
+        dur_total = time.time() - start
+        msg = f"完了: {meta['captured_pages']} ページ（総計{dur_total:.1f}s）\n保存先: {out_dir}"
+        logger.info(msg)
+        show_toast(APP_TITLE, msg)
 
     def hide(self):  # 互換用（将来削除予定）
         return self.quit()

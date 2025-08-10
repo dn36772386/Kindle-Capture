@@ -32,6 +32,12 @@
       <fluent-checkbox id="autocrop" checked>自動トリム</fluent-checkbox>
     </div>
     <div id="list"></div>
+    <div id="pp" style="display:none;padding:8px;">
+      <div id="pp_label" style="margin-bottom:6px;">トリミング中…</div>
+      <div style="height:10px;background:#ddd;">
+        <div id="pp_bar" style="height:10px;width:0%;background:#4caf50;"></div>
+      </div>
+    </div>
     <div class="row">
       <div class="hint">Enterで先頭候補を開始／Escで閉じる／↑↓で選択。</div>
       <div class="danger" id="err"></div>
@@ -42,6 +48,27 @@
     </div>
   </div>
 
+  <script>
+    window.initProgress = function(total){
+      const el=document.getElementById('pp'); if(!el) return; el.style.display='block';
+      el.dataset.total = total; el.dataset.cur = 0;
+      document.getElementById('pp_bar').style.width='0%';
+      document.getElementById('pp_label').textContent = 'トリミング中…';
+    };
+    window.stepProgress = function(cur){
+      const el=document.getElementById('pp'); if(!el||!el.dataset.total) return;
+      el.dataset.cur = cur;
+      const total = parseInt(el.dataset.total||'1',10);
+      const pct = Math.max(0, Math.min(100, Math.floor(100*cur/total)));
+      document.getElementById('pp_bar').style.width = pct + '%';
+      document.getElementById('pp_label').textContent = `トリミング中… ${cur}/${total}`;
+    };
+    window.finishProgress = function(){
+      const el=document.getElementById('pp'); if(!el) return;
+      document.getElementById('pp_bar').style.width = '100%';
+      document.getElementById('pp_label').textContent = '完了';
+    };
+  </script>
   <script src="main.js"></script>
 </body>
 </html>
