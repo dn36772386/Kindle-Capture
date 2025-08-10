@@ -90,6 +90,33 @@ def _detect_lr_bounds(np_bgr, mtop, mbot, mleft, mright):
     R = min(w, R + 2)
     return L, R
 
+
+def _detect_lr_bounds_color(np_bgr, mtop, mbot, mleft, mright, bg_tol=3, min_width=10):
+    """左右境界を背景色比較で検出し (left,right) を返す（旧ロジック互換）
+    ROI 左上近傍の色を背景とみなし、そこから有意に変化する最初/最後の列を境界とする。
+    """
+    h, w = np_bgr.shape[:2]
+    y0, y1 = max(0, mtop), max(0, h - mbot)
+    x0, x1 = max(0, mleft), max(0, w - mright)
+    if (y1 - y0) <= 0 or (x1 - x0) <= 0:
+        return 0, w
+    roi = np_bgr[y0:y1, x0:x1, :]
+    # BGR -> use small offset to avoid corner noise
+    yy = min(1, roi.shape[0]-1); xx = min(1, roi.shape[1]-1)
+    ref = roi[yy, xx, :].astype(np.int16)
+    diff = np.any(np.any(np.abs(roi.astype(np.int16) - ref) > int(bg_tol), axis=2), axis=0)
+    cols = np.where(diff)[0]
+    if cols.size == 0:
+        return 0, w
+    L = int(cols.min()) + x0
+    R = int(cols.max()) + x0 + 1  # 右は排他的
+    if (R - L) < int(min_width):
+        return 0, w
+    L = max(0, L - 2)
+    R = min(w, R + 2)
+    return L, R
+
+
 def auto_crop_content(pil_img, min_ratio=0.1, fallback_margin=10):
     np_img = np.array(pil_img.convert("RGB"))
     gray = cv2.cvtColor(np_img, cv2.COLOR_RGB2GRAY)
@@ -145,6 +172,118 @@ def _maybe_to_grayscale(pil_img, opt):
         return Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY), mode='L')
     return pil_img
 
+# ================= オーバーレイ検出 / クリーンフレーム待機 =================
+def _overlay_score(pil_img: Image.Image, opt) -> tuple[float, float]:
+    """中央帯と下部帯の暗画素比率（0..1, 0=明,1=暗）を返す"""
+    try:
+        g = pil_img.convert("L")
+        arr = np.asarray(g, dtype=np.uint8)
+        h, w = arr.shape
+        center_ratio = float(opt.get("overlay_center_ratio", 0.12))
+        bottom_ratio = float(opt.get("overlay_bottom_ratio", 0.18))
+        ch = max(1, int(h * center_ratio))
+        bh = max(1, int(h * bottom_ratio))
+        # 中央帯（横は中央 50%）
+        cw = max(1, int(w * 0.5))
+        cx0 = (w - cw)//2; cx1 = cx0 + cw
+        cy0 = (h - ch)//2; cy1 = cy0 + ch
+        center = arr[cy0:cy1, cx0:cx1]
+        bottom = arr[h-bh:h, :]
+        thr = int(opt.get("overlay_dark_threshold", 70))
+        c_dark = float((center < thr).mean()) if center.size else 0.0
+        b_dark = float((bottom < thr).mean()) if bottom.size else 0.0
+        return c_dark, b_dark
+    except Exception:
+        return 0.0, 0.0
+
+def _has_overlay(pil_img: Image.Image, opt) -> bool:
+    pr = float(opt.get("overlay_pixel_ratio", 0.06))
+    c_dark, b_dark = _overlay_score(pil_img, opt)
+    return (c_dark > pr) or (b_dark > pr)
+
+def _wait_for_clean_frame(rect, opt, logger, allow_toggle=False):
+    """オーバーレイ（中央メッセージ/下部バー）が消えかつ数フレーム安定するまで待つ"""
+    if not bool(opt.get("ui_clean_check", True)):
+        return grab_window_image(rect)
+    stable_need = int(opt.get("stable_frames_required", 3))
+    timeout = float(opt.get("ui_settle_timeout", 4.0))
+    interval = float(opt.get("ui_settle_check_interval", 0.15))
+    allow_retoggle = allow_toggle and bool(opt.get("allow_fs_retoggle", True)) and bool(opt.get("use_fullscreen_toggle", True))
+    t0 = time.time()
+    prev_hash = None
+    stable = 0
+    retoggled = False
+    while True:
+        img = grab_window_image(rect)
+        if not _has_overlay(img, opt):
+            hsh = average_hash(img)
+            if prev_hash is not None and hamming(prev_hash, hsh) <= 1:
+                stable += 1
+            else:
+                stable = 1
+            prev_hash = hsh
+            if stable >= stable_need:
+                return img
+        else:
+            stable = 0
+
+        if time.time() - t0 > timeout:
+            if allow_retoggle and not retoggled:
+                try:
+                    pyautogui.press(str(opt.get("fullscreen_key", "f11")))
+                    time.sleep(float(opt.get("after_fs_toggle_wait", 0.8)))
+                    pyautogui.press(str(opt.get("fullscreen_key", "f11")))
+                    time.sleep(float(opt.get("after_fs_toggle_wait", 0.8)))
+                    retoggled = True
+                    t0 = time.time()  # タイムアウトリセット
+                    logger.info("fullscreen re-toggle to clear overlay")
+                    continue
+                except Exception as e:
+                    logger.warning(f"fullscreen re-toggle failed: {e}")
+            # これ以上待たない
+            logger.info("overlay wait timeout; continue with current frame")
+            return img
+        time.sleep(interval)
+
+def _opposite_key(key: str) -> str:
+    k = (key or "").lower()
+    mapping = {
+        "right": "left",
+        "left": "right",
+        "pagedown": "pageup",
+        "pageup": "pagedown",
+    }
+    return mapping.get(k, "left")
+
+def _navigate_to_cover(rect, opt, logger):
+    if not bool(opt.get("go_to_cover_on_start", True)):
+        return
+    max_steps = int(opt.get("cover_seek_max_steps", 300))
+    stable_need = int(opt.get("cover_seek_stable_trials", 6))
+    back_key = _opposite_key(opt.get("next_key", "right"))
+    prev_img = grab_window_image(rect)
+    prev_hash = average_hash(prev_img)
+    stable = 0
+    for i in range(max_steps):
+        pyautogui.press(back_key)
+        time.sleep(max(0.05, float(opt.get("wait_after_turn", 0.3))))
+        cur_img = grab_window_image(rect)
+        cur_hash = average_hash(cur_img)
+        dist = hamming(prev_hash, cur_hash)
+        if dist < int(opt.get("change_hamming_threshold", 4)):
+            stable += 1
+            if stable >= stable_need:
+                logger.info(f"cover reached after {i+1} steps (stable streak)")
+                break
+        else:
+            stable = 0
+        prev_hash = cur_hash
+    # クリーン化待機（UI写り込み除去）
+    try:
+        _wait_for_clean_frame(rect, opt, logger, allow_toggle=True)
+    except Exception as e:
+        logger.warning(f"initial clean wait failed: {e}")
+
 def save_image(img: Image.Image, path: str, fmt: str = "png"):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if fmt.lower() == "png":
@@ -168,14 +307,12 @@ def turn_page(opt: dict):
     key = opt.get("next_key", "right")
     pyautogui.press(key)
 
+
 def run_capture(hwnd: int, opt: dict, logger):
     """
-    1) ウィンドウ矩形取得→クランプ
-    2) 変化待ち（差分待ち）
-    3) トリミング（左右境界 or 従来輪郭）
-    4) 見開き分割（任意）
-    5) リサイズ・グレースケール判定
-    6) 重複判定で終端検知
+    旧式互換を統合：
+    - legacy_final_recrop=True の場合、各ページは raw を一時保存し、最後に左右境界を全ページ同一に揃えて一括トリムして保存。
+    - legacy_final_recrop=False の場合は従来通り逐次トリムして保存。
     """
     rect_raw = get_window_rect(hwnd)
     rect = _clamp_rect(rect_raw)
@@ -237,9 +374,20 @@ def run_capture(hwnd: int, opt: dict, logger):
     page = 1
     captured = 0
     prev_sig = None          # 変化検出用
-    stable_lr = None         # 左右境界を安定化
+    stable_lr = None         # 左右境界（全ページでの minL / maxR）
+    saved_paths = []         # 逐次保存したファイル（legacy=False のとき用）
+    raw_paths = []           # legacy=True のときの raw 画像の保存先
 
-    logger.info(f"capture start: rect={rect}, out_dir={out_dir}")
+    # 旧式互換設定
+    legacy = bool(opt.get("legacy_final_recrop", True))
+    raw_subdir = str(opt.get("legacy_raw_subdir", "_raw"))
+    bg_tol = int(opt.get("bg_tolerance", 3))
+    method = str(opt.get("dynamic_trim_method", "variance")).lower()
+    raw_dir = os.path.join(out_dir, raw_subdir)
+    if legacy:
+        os.makedirs(raw_dir, exist_ok=True)
+
+    logger.info(f"capture start: rect={rect}, out_dir={out_dir}, legacy_final_recrop={legacy}")
 
     while page <= max_pages:
         # ページ遷移後の変化待ち（初回は即撮り）
@@ -250,54 +398,81 @@ def run_capture(hwnd: int, opt: dict, logger):
             base_img, cur_sig = _wait_until_change(rect, prev_sig, opt, logger)
 
         img = base_img
+
+        # --- 左右境界の検出（legacy でも毎回計算し、min/max を更新） ---
         if bool(opt.get("dynamic_trim", True)):
-            np_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-            L, R = _detect_lr_bounds(
-                np_bgr,
-                int(opt.get("trim_margin_top", 1)),
-                int(opt.get("trim_margin_bottom", 16)),
-                int(opt.get("trim_margin_left", 20)),
-                int(opt.get("trim_margin_right", 20)),
-            )
+            np_bgr = cv2.cvtColor(np.array(base_img), cv2.COLOR_RGB2BGR)
+            if method == "color":
+                L, R = _detect_lr_bounds_color(
+                    np_bgr,
+                    int(opt.get("trim_margin_top", 1)),
+                    int(opt.get("trim_margin_bottom", 16)),
+                    int(opt.get("trim_margin_left", 20)),
+                    int(opt.get("trim_margin_right", 20)),
+                    bg_tol=bg_tol
+                )
+            else:
+                L, R = _detect_lr_bounds(
+                    np_bgr,
+                    int(opt.get("trim_margin_top", 1)),
+                    int(opt.get("trim_margin_bottom", 16)),
+                    int(opt.get("trim_margin_left", 20)),
+                    int(opt.get("trim_margin_right", 20)),
+                )
             if stable_lr is None:
                 stable_lr = (L, R)
             else:
                 stable_lr = (min(stable_lr[0], L), max(stable_lr[1], R))
-            w_img, h_img = img.size
-            Lc, Rc = max(0, stable_lr[0]), min(w_img, stable_lr[1])
-            if Rc - Lc >= 10:
-                img = img.crop((Lc, 0, Rc, h_img))
-        elif auto_crop:
-            try:
-                img = auto_crop_content(img, min_ratio=min_ratio, fallback_margin=fb_margin)
-            except Exception as e:
-                logger.warning(f"auto_crop failed: {e}; fallback")
-                img = fallback_crop(img, fb_margin)
 
-        # 保存名
-        if split_double:
-            w, h = img.size
-            left = img.crop((0, 0, w//2, h))
-            right = img.crop((w//2, 0, w, h))
-            pL = os.path.join(out_dir, f"{base_title}_{ts}_{page:04}_L.{fmt}")
-            pR = os.path.join(out_dir, f"{base_title}_{ts}_{page:04}_R.{fmt}")
-            save_image(left, pL, fmt); save_image(right, pR, fmt)
-            cur_hash = average_hash(right)  # 代表として右で判定
-            logger.info(f"saved: {pL}, {pR}")
+        # --- legacy: raw保存のみ。非legacy: ここでトリム・分割・保存 ---
+        if legacy:
+            # raw を PNG で保存（後で一括処理）
+            p_raw = os.path.join(raw_dir, f"{base_title}_{ts}_{page:04}.png")
+            save_image(base_img, p_raw, "png")
+            raw_paths.append(p_raw)
+            # 重複検出用ハッシュは raw で計算
+            cur_hash = average_hash(base_img)
+            logger.info(f"saved raw: {p_raw} size={base_img.size}")
         else:
-            # リサイズ（幅基準）
-            rzw = int(opt.get("resize_width", 0) or 0)
-            if rzw > 0 and img.mode != 'L':
-                w0, h0 = img.size
-                if w0 > rzw:
-                    nh = int(round(h0 * (rzw / w0)))
-                    img = img.resize((rzw, nh), Image.LANCZOS)
-            # グレースケール判定
-            img_save = _maybe_to_grayscale(img, opt)
-            p = os.path.join(out_dir, f"{base_title}_{ts}_{page:04}.{fmt}")
-            save_image(img_save, p, fmt)
-            cur_hash = average_hash(img_save)
-            logger.info(f"saved: {p} size={img_save.size} mode={img_save.mode}")
+            # --- 従来の逐次処理 ---
+            if bool(opt.get("dynamic_trim", True)) and stable_lr is not None:
+                w_img, h_img = img.size
+                Lc, Rc = max(0, stable_lr[0]), min(w_img, stable_lr[1])
+                if Rc - Lc >= 10:
+                    img = img.crop((Lc, 0, Rc, h_img))
+            elif auto_crop:
+                try:
+                    img = auto_crop_content(img, min_ratio=min_ratio, fallback_margin=fb_margin)
+                except Exception as e:
+                    logger.warning(f"auto_crop failed: {e}; fallback")
+                    img = fallback_crop(img, fb_margin)
+
+            # 保存名
+            if split_double:
+                w, h = img.size
+                left = img.crop((0, 0, w//2, h))
+                right = img.crop((w//2, 0, w, h))
+                pL = os.path.join(out_dir, f"{base_title}_{ts}_{page:04}_L.{fmt}")
+                pR = os.path.join(out_dir, f"{base_title}_{ts}_{page:04}_R.{fmt}")
+                save_image(left, pL, fmt); save_image(right, pR, fmt)
+                cur_hash = average_hash(right)  # 代表として右で判定
+                saved_paths.extend([pL, pR])
+                logger.info(f"saved: {pL}, {pR}")
+            else:
+                # リサイズ（幅基準）
+                rzw = int(opt.get("resize_width", 0) or 0)
+                if rzw > 0 and img.mode != 'L':
+                    w0, h0 = img.size
+                    if w0 > rzw:
+                        nh = int(round(h0 * (rzw / w0)))
+                        img = img.resize((rzw, nh), Image.LANCZOS)
+                # グレースケール判定
+                img_save = _maybe_to_grayscale(img, opt)
+                p = os.path.join(out_dir, f"{base_title}_{ts}_{page:04}.{fmt}")
+                save_image(img_save, p, fmt)
+                cur_hash = average_hash(img_save)
+                saved_paths.append(p)
+                logger.info(f"saved: {p} size={img_save.size} mode={img_save.mode}")
 
         captured += 1
         prev_sig = cur_sig
@@ -320,6 +495,72 @@ def run_capture(hwnd: int, opt: dict, logger):
 
     if captured == 0:
         raise CaptureError("1枚も保存できませんでした。設定と対象を確認してください。")
+
+    # --- legacy: 最終一括トリム ---
+    if legacy:
+        if stable_lr is None:
+            # 予備: 安全側で枠なし
+            logger.warning("stable_lr is None; skip final recrop")
+        else:
+            Lc, Rc = int(max(0, stable_lr[0])), int(stable_lr[1])
+            logger.info(f"final recrop with stable_lr=({Lc},{Rc}) on {len(raw_paths)} pages")
+        # 出力
+        for i, p_raw in enumerate(raw_paths, start=1):
+            try:
+                im = Image.open(p_raw)
+                w0, h0 = im.size
+                if stable_lr is not None:
+                    Lb, Rb = max(0, Lc), min(w0, Rc)
+                    if (Rb - Lb) >= 10:
+                        im = im.crop((Lb, 0, Rb, h0))
+                # 見開き分割
+                if split_double:
+                    w, h = im.size
+                    left = im.crop((0, 0, w//2, h))
+                    right = im.crop((w//2, 0, w, h))
+                    pL = os.path.join(out_dir, f"{base_title}_{ts}_{i:04}_L.{fmt}")
+                    pR = os.path.join(out_dir, f"{base_title}_{ts}_{i:04}_R.{fmt}")
+                    # リサイズ・グレースケール（左右それぞれ）
+                    if int(opt.get("resize_width", 0) or 0) > 0 and left.mode != 'L':
+                        rzw = int(opt.get("resize_width", 0) or 0)
+                        if left.size[0] > rzw:
+                            nh = int(round(left.size[1] * (rzw / left.size[0])))
+                            left = left.resize((rzw, nh), Image.LANCZOS)
+                        if right.size[0] > rzw:
+                            nh = int(round(right.size[1] * (rzw / right.size[0])))
+                            right = right.resize((rzw, nh), Image.LANCZOS)
+                    left = _maybe_to_grayscale(left, opt)
+                    right = _maybe_to_grayscale(right, opt)
+                    save_image(left, pL, fmt); save_image(right, pR, fmt)
+                else:
+                    # リサイズ
+                    rzw = int(opt.get("resize_width", 0) or 0)
+                    if rzw > 0 and im.mode != 'L':
+                        w0, h0 = im.size
+                        if w0 > rzw:
+                            nh = int(round(h0 * (rzw / w0)))
+                            im = im.resize((rzw, nh), Image.LANCZOS)
+                    im = _maybe_to_grayscale(im, opt)
+                    p = os.path.join(out_dir, f"{base_title}_{ts}_{i:04}.{fmt}")
+                    save_image(im, p, fmt)
+            except Exception as e:
+                logger.warning(f"final recrop failed at page {i}: {e}")
+
+        # raw削除
+        if not bool(opt.get("legacy_keep_raw", False)):
+            try:
+                for p_raw in raw_paths:
+                    try:
+                        os.remove(p_raw)
+                    except Exception:
+                        pass
+                # 空ならディレクトリ削除
+                try:
+                    os.rmdir(raw_dir)
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning(f"cleanup raw failed: {e}")
 
     # --- フルスクリーン解除 ---
     if bool(opt.get("use_fullscreen_toggle", True)) and bool(opt.get("exit_fullscreen_on_finish", True)):

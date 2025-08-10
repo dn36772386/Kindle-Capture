@@ -64,6 +64,35 @@ class Settings:
     trim_margin_bottom: int = 16
     trim_margin_left: int = 20
     trim_margin_right: int = 20
+    # --- 旧式一括トリム（レガシー最終再クロップ用フラグ群） ---
+    legacy_final_recrop: bool = True
+    legacy_keep_raw: bool = False
+    legacy_raw_subdir: str = "_raw"
+    dynamic_trim_method: str = "color"   # "color"|"variance" 将来的拡張用
+    bg_tolerance: int = 3
+
+    # --- 起動時の表紙移動とUI写り込み対策 ---
+    go_to_cover_on_start: bool = True
+    cover_seek_max_steps: int = 300
+    cover_seek_stable_trials: int = 6
+    ui_clean_check: bool = True
+    ui_settle_timeout: float = 4.0
+    ui_settle_check_interval: float = 0.15
+    stable_frames_required: int = 3
+    allow_fs_retoggle: bool = True
+    after_fs_toggle_wait: float = 0.8
+    overlay_dark_threshold: int = 70       # 0..255（暗さ閾値）
+    overlay_center_ratio: float = 0.12     # 画面中央帯の高さ比
+    overlay_bottom_ratio: float = 0.18     # 画面下部帯の高さ比
+    overlay_pixel_ratio: float = 0.06      # 帯領域内の暗画素割合閾値
+
+    # 旧式互換（最終一括トリム）
+    legacy_final_recrop: bool = True       # True: 逐次保存せず、最後に全ページ同じ左右で一括トリム
+    legacy_keep_raw: bool = False          # True: raw一時ファイルを残す
+    legacy_raw_subdir: str = "_raw"        # raw保存のサブフォルダ名
+    dynamic_trim_method: str = "color"  # "variance" or "color"
+    bg_tolerance: int = 3                  # dynamic_trim_method="color" のときの背景色許容差
+
 
     # --- グレースケール判定 ---
     grayscale_detect: bool = True
